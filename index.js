@@ -1,8 +1,8 @@
-const asyncHooks = require('async_hooks')
+const AsyncLocalStorage = require('async_hooks').AsyncLocalStorage
 const uuid = require('uuid')
 const {NORMAL, SANDBOX, ROLLBACK} = require('./constants')
 
-/** 
+/**
  *  Create a wrapper around pg-postgres that can capture references to transactions
  *  and trace async function calls.
  */
@@ -13,41 +13,18 @@ class Sandboxer {
     this.mode = options.mode || NORMAL
     this.sandboxes = {}
     this.context = new Map()
-
-    if (options.mode === SANDBOX ) {
-      
-      // With async_hooks, we can capture references to event and promise 
-      // creation/destruction by id. Each async call has an id, and each 
-      // function that triggers an async call has an id. 
-      // 
-      // We can store a reference to the initial trigger on every promise, and 
-      // keep track of what "scope" our function is in. We can use this reference
-      // to isolate our postgres transactions.
-
-      asyncHooks.createHook({
-        init: (asyncId, _type, triggerAsyncId) =>{
-          if (this.context.has(triggerAsyncId)) {
-            this.context.set(asyncId, this.context.get(triggerAsyncId))
-          }
-        },
-        destroy: (asyncId) => {
-          if (this.context.has(asyncId)) {
-              this.context.delete(asyncId);
-          }
-        }
-      }).enable()
-    }
+    this.asyncLocalStorage = new AsyncLocalStorage()
   }
 
   _getConn() {
     // if we're scoped within a sandbox, grab the sandbox client so we can
-    // transparently add the next query to the sandboxed transaction, otherwise 
+    // transparently add the next query to the sandboxed transaction, otherwise
     // use the base database client.
 
     if (this.mode === NORMAL) return this.pg
 
-    const id = this.context.get(asyncHooks.executionAsyncId())
-    const found = this.sandboxes[id] 
+    const id = this.context.get(this.asyncLocalStorage.getStore())
+    const found = this.sandboxes[id]
     let conn = found ? found.tx : this.pg
     return conn
   }
@@ -58,7 +35,7 @@ class Sandboxer {
    */
   createSandbox() {
     const id = uuid.v4()
-    this.context.set(asyncHooks.executionAsyncId(), id)
+    this.context.set(this.asyncLocalStorage.getStore(), id)
 
     const grabTransactionReference = (callback) => (tx) => new Promise((_, rollback)=> {
       this.sandboxes[id] = { tx, rollback }
@@ -68,16 +45,16 @@ class Sandboxer {
 
     return new Promise((resolve, reject) => {
       let resolved = false
-      this.pg.tx(grabTransactionReference((id) => { 
+      this.pg.tx(grabTransactionReference((id) => {
         resolved = true
-        resolve(id) 
+        resolve(id)
       }))
-      .catch((err) => {
-        if (!resolved || err !== ROLLBACK) {
-          reject(err)
-        }
+        .catch((err) => {
+          if (!resolved || err !== ROLLBACK) {
+            reject(err)
+          }
 
-      })
+        })
     })
   }
 
@@ -85,7 +62,8 @@ class Sandboxer {
    * Closes a transaction sandbox, rolling back all changes.
    */
   async closeSandbox() {
-    const id = this.context.get(asyncHooks.executionAsyncId());
+    const id = this.context.get(this.asyncLocalStorage.getStore());
+
     const conn = this.sandboxes[id]
     if (!conn) return this
     
